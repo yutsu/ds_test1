@@ -71,6 +71,15 @@ output:
   # ファイル名テンプレート
   filename_template: "research_{query}_{timestamp}"
 
+  # ファイル名生成設定
+  filename_generation:
+    # 重複時の処理方法: timestamp, version, both
+    duplicate_handling: "both"
+    # タイムスタンプ形式: YYYYMMDD_HHMMSS, YYYY-MM-DD_HH-MM-SS
+    timestamp_format: "YYYYMMDD_HHMMSS"
+    # バージョン番号のプレフィックス
+    version_prefix: "v"
+
   # マークダウン設定
   markdown:
     include_search_results: true
