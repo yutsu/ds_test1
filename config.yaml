@@ -9,7 +9,7 @@ language_model:
   # Ollama設定
   ollama:
     model_name: "llama3.1:8b"
-    base_url: "http://localhost:11434"
+    base_url: "http://localhost:11434"  # 別のポートを使用する場合は変更
 
   # OpenAI設定
   openai:
@@ -46,9 +46,9 @@ search:
 
   # レート制限設定
   rate_limit:
-    requests_per_second: 8  # 1秒あたりのリクエスト数（安全マージン）
-    max_retries: 3          # 最大リトライ回数
-    retry_delay_base: 2     # 基本待機時間（秒）
+    requests_per_second: 2  # 1秒あたりのリクエスト数（より保守的に）
+    max_retries: 5          # 最大リトライ回数（増加）
+    retry_delay_base: 5     # 基本待機時間（秒）（増加）
 
   # Google Custom Search設定
   google:

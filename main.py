@@ -15,9 +15,10 @@ import markdown
 from dotenv import load_dotenv
 import re
 import yaml
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import random
+from pydantic import BaseModel, Field, validator
 
 # 環境変数を読み込み
 load_dotenv()
@@ -71,7 +72,7 @@ class Config:
                 return config
         else:
             # デフォルト設定
-            return {
+            default_config = {
                 'language_model': {
                     'default': 'ollama',
                     'ollama': {'model_name': 'llama2', 'base_url': 'http://localhost:11434'},
@@ -87,6 +88,11 @@ class Config:
                 'search': {
                     'engine': 'google',
                     'max_results': 5,
+                    'rate_limit': {
+                        'requests_per_second': 8,
+                        'max_retries': 3,
+                        'retry_delay_base': 2
+                    },
                     'google': {
                         'api_key': os.getenv('GOOGLE_SEARCH_API_KEY'),
                         'search_engine_id': os.getenv('GOOGLE_SEARCH_ENGINE_ID')
@@ -95,6 +101,7 @@ class Config:
                 'citations': {
                     'auto_extract': True,
                     'relevance_threshold': 0.5,
+                    'reliability_threshold': 0.3,
                     'format': 'numbered'
                 },
                 'output': {
@@ -111,6 +118,7 @@ class Config:
                     }
                 }
             }
+            return default_config
 
     def _expand_env_vars(self, obj):
         """辞書内の環境変数を展開"""
@@ -119,7 +127,12 @@ class Config:
                 if isinstance(value, str) and value.startswith('${') and value.endswith('}'):
                     # ${VAR_NAME} 形式の環境変数を展開
                     env_var = value[2:-1]  # ${} を除去
-                    obj[key] = os.getenv(env_var, value)
+                    expanded_value = os.getenv(env_var, value)
+                    if expanded_value != value:
+                        print(f"🔧 環境変数を展開: {env_var} = {expanded_value[:10]}...")
+                    else:
+                        print(f"⚠️  環境変数が見つかりません: {env_var}")
+                    obj[key] = expanded_value
                 elif isinstance(value, (dict, list)):
                     self._expand_env_vars(value)
         elif isinstance(obj, list):
@@ -144,6 +157,110 @@ class LanguageModel:
     def generate(self, prompt: str) -> str:
         """プロンプトからテキストを生成"""
         raise NotImplementedError
+
+    def generate_structured(self, prompt: str, response_model: BaseModel) -> BaseModel:
+        """構造化されたレスポンスを生成"""
+        # 構造化プロンプトを作成
+        structured_prompt = self._create_structured_prompt(prompt, response_model)
+
+        # 通常の生成を実行
+        response_text = self.generate(structured_prompt)
+
+        # JSONレスポンスを抽出してパース
+        try:
+            json_data = self._extract_json_from_response(response_text)
+            return response_model(**json_data)
+        except Exception as e:
+            print(f"⚠️  構造化レスポンスの解析に失敗: {e}")
+            print(f"   レスポンス: {response_text[:200]}...")
+            # フォールバック: デフォルト値を返す
+            return self._create_fallback_response(response_model)
+
+    def _create_structured_prompt(self, prompt: str, response_model: BaseModel) -> str:
+        """構造化プロンプトを作成"""
+        schema = response_model.schema()
+
+        structured_prompt = f"""
+{prompt}
+
+重要: 以下のJSONスキーマに従って、正確なJSON形式で回答してください。
+番号や記号、説明文は含めず、純粋なJSONのみを返してください。
+
+JSONスキーマ:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+回答例:
+{self._generate_example_response(response_model)}
+
+JSON回答:
+"""
+        return structured_prompt
+
+    def _generate_example_response(self, response_model: BaseModel) -> str:
+        """レスポンスモデルの例を生成"""
+        if response_model == AdditionalQueriesResponse:
+            return json.dumps({
+                "keywords": ["市場規模 統計", "AI規制 法律", "倫理ガイドライン", "雇用影響 調査", "医療AI 応用"]
+            }, ensure_ascii=False, indent=2)
+        elif response_model == AnalysisResponse:
+            return json.dumps({
+                "main_facts": ["2024年にAI技術が大幅に進歩した", "大規模言語モデルの性能が向上した"],
+                "data_statistics": ["市場規模は前年比30%増加", "企業導入率は60%に達した"],
+                "different_perspectives": ["技術的進歩を評価する意見", "雇用への影響を懸念する意見"],
+                "date_analysis": ["2024年の情報は最新", "2023年のデータは過去の情報"],
+                "unknown_points": ["具体的な規制内容", "長期的な影響の詳細"]
+            }, ensure_ascii=False, indent=2)
+        elif response_model == SummaryResponse:
+            return json.dumps({
+                "key_facts": ["AI技術が2024年に大幅進歩", "企業導入が加速", "規制議論が活発化"],
+                "conclusion": "AI技術は急速に発展しているが、規制や倫理面での課題も存在する",
+                "date_summary": "2024年の最新情報を中心に構成"
+            }, ensure_ascii=False, indent=2)
+        else:
+            return "{}"
+
+    def _extract_json_from_response(self, response_text: str) -> dict:
+        """レスポンステキストからJSONを抽出"""
+        # JSONブロックを探す
+        json_start = response_text.find('{')
+        json_end = response_text.rfind('}') + 1
+
+        if json_start == -1 or json_end == 0:
+            raise ValueError("JSONが見つかりません")
+
+        json_str = response_text[json_start:json_end]
+
+        # 複数のJSONブロックがある場合は最後のものを使用
+        if json_str.count('{') > 1:
+            # ネストされたJSONを処理
+            brace_count = 0
+            start_pos = -1
+            for i, char in enumerate(json_str):
+                if char == '{':
+                    if brace_count == 0:
+                        start_pos = i
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_pos != -1:
+                        json_str = json_str[start_pos:i+1]
+                        break
+
+        return json.loads(json_str)
+
+    def _create_fallback_response(self, response_model: BaseModel) -> BaseModel:
+        """フォールバック用のデフォルトレスポンスを作成"""
+        if response_model == AdditionalQueriesResponse:
+            return AdditionalQueriesResponse(keywords=["追加検索が必要"])
+        elif response_model == AnalysisResponse:
+            return AnalysisResponse(main_facts=["検索結果の分析が必要"])
+        elif response_model == SummaryResponse:
+            return SummaryResponse(
+                key_facts=["要約が必要"],
+                conclusion="検索結果の要約が必要です"
+            )
+        else:
+            return response_model()
 
 class OllamaModel(LanguageModel):
     """Ollamaローカルモデル"""
@@ -239,6 +356,15 @@ class WebSearcher:
         self.max_retries = config.get('search.rate_limit.max_retries', 3)
         self.retry_delay_base = config.get('search.rate_limit.retry_delay_base', 2)
         self.last_request_time = 0
+
+        # キャッシュ機能
+        self.search_cache = {}
+
+        # デバッグ情報
+        print(f"🔧 WebSearcher初期化:")
+        print(f"   APIキー: {'設定済み' if self.api_key else '未設定'}")
+        print(f"   検索エンジンID: {'設定済み' if self.search_engine_id else '未設定'}")
+        print(f"   レート制限: {self.requests_per_second} req/sec, {self.max_retries}回リトライ")
 
     def _extract_date_info(self, title: str, snippet: str) -> Optional[str]:
         """タイトルとスニペットから日付情報を抽出"""
@@ -338,6 +464,12 @@ class WebSearcher:
         if num_results is None:
             num_results = self.config.get('search.max_results', 5)
 
+        # キャッシュチェック
+        cache_key = f"{query}_{num_results}"
+        if cache_key in self.search_cache:
+            print(f"📋 キャッシュから検索結果を取得: {query}")
+            return self.search_cache[cache_key]
+
         # レート制限の適用
         self._apply_rate_limit()
 
@@ -358,6 +490,13 @@ class WebSearcher:
                     'num': min(num_results, 10)  # Google APIの最大値は10
                 }
 
+                # デバッグ情報（APIキーは一部マスク）
+                masked_key = api_key[:10] + "..." if api_key else "未設定"
+                print(f"🔍 検索リクエスト: {query}")
+                print(f"   APIキー: {masked_key}")
+                print(f"   検索エンジンID: {search_engine_id}")
+                print(f"   結果数: {params['num']}")
+
                 response = requests.get(url, params=params)
 
                 # レスポンスの処理
@@ -374,6 +513,7 @@ class WebSearcher:
                     response.raise_for_status()
 
                 data = response.json()
+                print(f"✅ 検索成功: {len(data.get('items', []))}件の結果を取得")
 
                 results = []
                 if 'items' in data:
@@ -399,6 +539,8 @@ class WebSearcher:
                         )
                         results.append(result)
 
+                # 結果をキャッシュに保存
+                self.search_cache[cache_key] = results
                 return results
 
             except requests.exceptions.RequestException as e:
@@ -462,6 +604,129 @@ class CitationManager:
     def get_all_citations(self) -> List[Citation]:
         """全ての引用を取得"""
         return self.citations
+
+class AdditionalQueriesResponse(BaseModel):
+    """追加検索キーワードの構造化レスポンス"""
+    keywords: List[str] = Field(
+        description="追加検索用のキーワードリスト（最大5個）",
+        max_items=5,
+        min_items=1
+    )
+
+    @validator('keywords')
+    def validate_keywords(cls, v):
+        """キーワードの検証"""
+        if not v:
+            raise ValueError('キーワードは必須です')
+
+        # 空文字や短すぎるキーワードを除外
+        filtered = []
+        for keyword in v:
+            keyword = keyword.strip()
+            if keyword and len(keyword) >= 2:
+                # 説明文や指示文を除外
+                if not any(exclude in keyword.lower() for exclude in [
+                    'キーワード', '追加', '提案', '以下の', '各キーワード',
+                    '番号や記号', '重要', '分析で言及', '関連する',
+                    '比較対象', '最新の', '反対意見', '特に', 'また'
+                ]):
+                    filtered.append(keyword)
+
+        if not filtered:
+            raise ValueError('有効なキーワードが見つかりません')
+
+        return filtered[:5]  # 最大5個まで
+
+class AnalysisResponse(BaseModel):
+    """分析結果の構造化レスポンス"""
+    main_facts: List[str] = Field(
+        description="検索結果から得られる主要な事実（重要度順）",
+        min_items=1
+    )
+    data_statistics: List[str] = Field(
+        description="検索結果に含まれる具体的なデータや統計",
+        default=[]
+    )
+    different_perspectives: List[str] = Field(
+        description="検索結果から読み取れる異なる視点や意見",
+        default=[]
+    )
+    date_analysis: List[str] = Field(
+        description="各情報の日付と今日との関係",
+        default=[]
+    )
+    unknown_points: List[str] = Field(
+        description="検索結果からは不明な点や追加で調べるべき点",
+        default=[]
+    )
+
+    def to_text(self) -> str:
+        """構造化データをテキスト形式に変換"""
+        text_parts = []
+
+        if self.main_facts:
+            text_parts.append("主要な事実:")
+            for i, fact in enumerate(self.main_facts, 1):
+                text_parts.append(f"{i}. {fact}")
+            text_parts.append("")
+
+        if self.data_statistics:
+            text_parts.append("具体的なデータ・統計:")
+            for i, data in enumerate(self.data_statistics, 1):
+                text_parts.append(f"{i}. {data}")
+            text_parts.append("")
+
+        if self.different_perspectives:
+            text_parts.append("異なる視点・意見:")
+            for i, perspective in enumerate(self.different_perspectives, 1):
+                text_parts.append(f"{i}. {perspective}")
+            text_parts.append("")
+
+        if self.date_analysis:
+            text_parts.append("日付分析:")
+            for i, date_info in enumerate(self.date_analysis, 1):
+                text_parts.append(f"{i}. {date_info}")
+            text_parts.append("")
+
+        if self.unknown_points:
+            text_parts.append("不明な点・追加調査項目:")
+            for i, point in enumerate(self.unknown_points, 1):
+                text_parts.append(f"{i}. {point}")
+
+        return "\n".join(text_parts)
+
+class SummaryResponse(BaseModel):
+    """要約の構造化レスポンス"""
+    key_facts: List[str] = Field(
+        description="最も重要な事実（3-5点）",
+        min_items=1,
+        max_items=5
+    )
+    conclusion: str = Field(
+        description="検索結果から読み取れる結論",
+        min_length=10
+    )
+    date_summary: Optional[str] = Field(
+        description="重要な日付情報の要約",
+        default=None
+    )
+
+    def to_text(self) -> str:
+        """構造化データをテキスト形式に変換"""
+        text_parts = []
+
+        text_parts.append("重要な事実:")
+        for i, fact in enumerate(self.key_facts, 1):
+            text_parts.append(f"{i}. {fact}")
+        text_parts.append("")
+
+        if self.date_summary:
+            text_parts.append(f"日付情報: {self.date_summary}")
+            text_parts.append("")
+
+        text_parts.append(f"結論: {self.conclusion}")
+
+        return "\n".join(text_parts)
 
 class DeepResearch:
     """Deep Researchのメインクラス（改善版）"""
@@ -582,7 +847,7 @@ class DeepResearch:
         )
 
     def _analyze_results(self, query: str, search_results: List[SearchResult]) -> str:
-        """検索結果を分析"""
+        """検索結果を分析（構造化版）"""
         # 今日の日付情報を準備
         today_info = f"今日の日付: {self.today_date}"
 
@@ -633,7 +898,6 @@ class DeepResearch:
 - 検索結果からは不明な点や追加で調べるべき点
 
 重要：検索結果に含まれていない情報は記載せず、事実のみを記載してください。
-分析結果を日本語で詳しく記述してください。
 """)
 
         prompt = prompt_template.format(
@@ -641,7 +905,19 @@ class DeepResearch:
             results_text=results_text,
             today_info=today_info
         )
-        return self.model.generate(prompt)
+
+        try:
+            # 構造化レスポンスを生成
+            response = self.model.generate_structured(prompt, AnalysisResponse)
+            print(f"✅ 構造化レスポンスで分析を生成")
+            return response.to_text()
+        except Exception as e:
+            print(f"⚠️  構造化レスポンスの生成に失敗: {e}")
+            print("   フォールバック: 従来の方法で分析を生成")
+
+            # フォールバック: 従来の方法
+            fallback_prompt = prompt + "\n\n分析結果を日本語で詳しく記述してください。"
+            return self.model.generate(fallback_prompt)
 
     def _analyze_all_results(self, query: str, all_results: List[SearchResult]) -> str:
         """全検索結果を分析"""
@@ -704,7 +980,7 @@ class DeepResearch:
         return self.model.generate(prompt)
 
     def _create_summary(self, query: str, analysis: str) -> str:
-        """要約を生成"""
+        """要約を生成（構造化版）"""
         # 設定ファイルからプロンプトを取得、なければデフォルトを使用
         prompt_template = self.config.get('prompts.summary', """
 以下の分析結果のみを基に、'{query}'について簡潔な要約を作成してください。分析結果に含まれていない情報は推測せず、事実のみを記載してください。
@@ -718,14 +994,25 @@ class DeepResearch:
 - 結論（検索結果から読み取れる範囲で）
 
 重要：分析結果に含まれていない情報は記載せず、事実のみを記載してください。
-要約を日本語で簡潔に記述してください。
 """)
 
         prompt = prompt_template.format(query=query, analysis=analysis)
-        return self.model.generate(prompt)
+
+        try:
+            # 構造化レスポンスを生成
+            response = self.model.generate_structured(prompt, SummaryResponse)
+            print(f"✅ 構造化レスポンスで要約を生成")
+            return response.to_text()
+        except Exception as e:
+            print(f"⚠️  構造化レスポンスの生成に失敗: {e}")
+            print("   フォールバック: 従来の方法で要約を生成")
+
+            # フォールバック: 従来の方法
+            fallback_prompt = prompt + "\n\n要約を日本語で簡潔に記述してください。"
+            return self.model.generate(fallback_prompt)
 
     def _generate_additional_queries(self, original_query: str, analysis: str, summary: str) -> List[str]:
-        """レビューモデルで追加検索キーワードを生成"""
+        """レビューモデルで追加検索キーワードを生成（構造化版）"""
         # 今日の日付情報を準備
         today_info = f"今日の日付: {self.today_date}"
 
@@ -756,15 +1043,6 @@ class DeepResearch:
 また、将来の予定について最新の進捗や変更がないか確認するためのキーワードも提案してください。
 
 各キーワードは具体的で検索しやすい形で提案してください。
-以下の形式で最大5つのキーワードを提案してください：
-
-キーワード1
-キーワード2
-キーワード3
-キーワード4
-キーワード5
-
-番号や記号は付けずに、キーワードのみを改行区切りで記載してください。
 """)
 
         prompt = prompt_template.format(
@@ -773,34 +1051,45 @@ class DeepResearch:
             summary=summary,
             today_info=today_info
         )
-        response = self.review_model.generate(prompt)
 
-        # レスポンスからキーワードを抽出（改善版）
-        lines = response.strip().split('\n')
-        queries = []
-        for line in lines:
-            line = line.strip()
-            # 空行、番号、記号、説明文を除外
-            if (line and
-                not line.startswith(('#', '-', '*', '1.', '2.', '3.', '4.', '5.', 'キーワード', '追加', '提案')) and
-                len(line) > 2 and  # 短すぎる行を除外
-                not line.endswith(':') and  # 説明文を除外
-                not line.startswith('以下の') and  # 説明文を除外
-                not line.startswith('各キーワード') and  # 説明文を除外
-                not line.startswith('番号や記号') and  # 説明文を除外
-                not line.startswith('重要') and  # 説明文を除外
-                not line.startswith('分析で言及') and  # 説明文を除外
-                not line.startswith('関連する') and  # 説明文を除外
-                not line.startswith('比較対象') and  # 説明文を除外
-                not line.startswith('最新の') and  # 説明文を除外
-                not line.startswith('反対意見') and  # 説明文を除外
-                not line.startswith('特に') and  # 説明文を除外
-                not line.startswith('また') and  # 説明文を除外
-                not line.startswith('各キーワード')):  # 説明文を除外
-                queries.append(line)
+        try:
+            # 構造化レスポンスを生成
+            response = self.review_model.generate_structured(prompt, AdditionalQueriesResponse)
+            print(f"✅ 構造化レスポンスで追加クエリを生成: {response.keywords}")
+            return response.keywords
+        except Exception as e:
+            print(f"⚠️  構造化レスポンスの生成に失敗: {e}")
+            print("   フォールバック: 従来の方法でキーワードを抽出")
 
-        print(f"生成された追加クエリ: {queries}")
-        return queries[:5]  # 最大5つまで
+            # フォールバック: 従来の方法
+            fallback_response = self.review_model.generate(prompt + "\n\nキーワードのみを改行区切りで記載してください:")
+
+            # レスポンスからキーワードを抽出（改善版）
+            lines = fallback_response.strip().split('\n')
+            queries = []
+            for line in lines:
+                line = line.strip()
+                # 空行、番号、記号、説明文を除外
+                if (line and
+                    not line.startswith(('#', '-', '*', '1.', '2.', '3.', '4.', '5.', 'キーワード', '追加', '提案')) and
+                    len(line) > 2 and  # 短すぎる行を除外
+                    not line.endswith(':') and  # 説明文を除外
+                    not line.startswith('以下の') and  # 説明文を除外
+                    not line.startswith('各キーワード') and  # 説明文を除外
+                    not line.startswith('番号や記号') and  # 説明文を除外
+                    not line.startswith('重要') and  # 説明文を除外
+                    not line.startswith('分析で言及') and  # 説明文を除外
+                    not line.startswith('関連する') and  # 説明文を除外
+                    not line.startswith('比較対象') and  # 説明文を除外
+                    not line.startswith('最新の') and  # 説明文を除外
+                    not line.startswith('反対意見') and  # 説明文を除外
+                    not line.startswith('特に') and  # 説明文を除外
+                    not line.startswith('また') and  # 説明文を除外
+                    not line.startswith('各キーワード')):  # 説明文を除外
+                    queries.append(line)
+
+            print(f"生成された追加クエリ（フォールバック）: {queries}")
+            return queries[:5]  # 最大5つまで
 
     def _create_final_report(self, query: str, analysis: str, summary: str) -> str:
         """最終レポートを生成（統合版）"""
