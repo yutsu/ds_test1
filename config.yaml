@@ -25,7 +25,7 @@ language_model:
 # 反復改善設定
 iteration:
   # 最大反復回数
-  max_iterations: 6
+  max_iterations: 8
 
   # 初期検索結果数
   initial_search_count: 8
@@ -34,7 +34,7 @@ iteration:
   additional_search_count: 5
 
   # 追加検索クエリの最大数
-  max_additional_queries: 3
+  max_additional_queries: 5
 
 # Web検索設定
 search:

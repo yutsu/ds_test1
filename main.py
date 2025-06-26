@@ -248,7 +248,29 @@ JSON回答:
                         json_str = json_str[start_pos:i+1]
                         break
 
-        return json.loads(json_str)
+        # JSONエスケープ文字を適切に処理
+        try:
+            # まず通常のJSONパースを試行
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            # エスケープ文字の問題がある場合、手動で修正
+            if "Invalid \\escape" in str(e):
+                # 一般的なエスケープ文字を修正
+                json_str = json_str.replace('\\n', '\\\\n')
+                json_str = json_str.replace('\\"', '\\\\"')
+                json_str = json_str.replace('\\t', '\\\\t')
+                json_str = json_str.replace('\\r', '\\\\r')
+
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    # それでも失敗する場合は、より積極的な修正
+                    import re
+                    # バックスラッシュを適切にエスケープ
+                    json_str = re.sub(r'\\(?!["\\/bfnrt])', r'\\\\', json_str)
+                    return json.loads(json_str)
+            else:
+                raise e
 
     def _create_fallback_response(self, response_model: BaseModel) -> BaseModel:
         """フォールバック用のデフォルトレスポンスを作成"""
@@ -407,11 +429,49 @@ class DuckDuckGoSearcher:
                 html_results = self._search_html(query, num_results - len(results))
                 results.extend(html_results)
 
+            # それでも結果が少ない場合は、クエリを簡略化して再試行
+            if len(results) < 3 and len(query.split()) > 3:
+                print(f"⚠️  結果が少ないため、クエリを簡略化して再試行: {query}")
+                simplified_query = self._simplify_query(query)
+                if simplified_query != query:
+                    simplified_results = self._search_simplified(simplified_query, num_results - len(results))
+                    results.extend(simplified_results)
+
             print(f"✅ DuckDuckGo検索完了: {len(results)}件の結果")
             return results[:num_results]
 
         except Exception as e:
             print(f"❌ DuckDuckGo検索エラー: {e}")
+            return []
+
+    def _simplify_query(self, query: str) -> str:
+        """クエリを簡略化"""
+        # 年号や具体的な日付を削除
+        import re
+        simplified = re.sub(r'\d{4}年', '', query)
+        simplified = re.sub(r'\d{1,2}月', '', simplified)
+        simplified = re.sub(r'\d{1,2}日', '', simplified)
+
+        # 複数の空白を単一の空白に
+        simplified = re.sub(r'\s+', ' ', simplified)
+
+        # 先頭と末尾の空白を削除
+        simplified = simplified.strip()
+
+        # 3単語以上の場合、最初の3単語のみを使用
+        words = simplified.split()
+        if len(words) > 3:
+            simplified = ' '.join(words[:3])
+
+        return simplified
+
+    def _search_simplified(self, simplified_query: str, num_results: int) -> List[SearchResult]:
+        """簡略化されたクエリで検索"""
+        try:
+            print(f"🔄 簡略化クエリで検索: {simplified_query}")
+            return self._search_html(simplified_query, num_results)
+        except Exception as e:
+            print(f"❌ 簡略化クエリ検索エラー: {e}")
             return []
 
     def _search_html(self, query: str, num_results: int) -> List[SearchResult]:
@@ -833,23 +893,85 @@ class AnalysisResponse(BaseModel):
     """分析結果の構造化レスポンス"""
     analysis_text: str = Field(
         description="構造化された分析結果のテキスト",
-        min_length=10
+        min_length=10,
+        default=""
     )
+
+    # 古い形式との互換性のため
+    main_facts: List[str] = Field(default_factory=list)
+    data_statistics: List[str] = Field(default_factory=list)
+    different_perspectives: List[str] = Field(default_factory=list)
+    date_analysis: List[str] = Field(default_factory=list)
+    unknown_points: List[str] = Field(default_factory=list)
 
     def to_text(self) -> str:
         """構造化データをテキスト形式に変換"""
-        return self.analysis_text
+        if self.analysis_text:
+            return self.analysis_text
+
+        # 古い形式からテキストを生成
+        text_parts = []
+
+        if self.main_facts:
+            text_parts.append("## 主要な事実")
+            for i, fact in enumerate(self.main_facts, 1):
+                text_parts.append(f"{i}. {fact}")
+
+        if self.data_statistics:
+            text_parts.append("\n## 具体的なデータ・統計")
+            for i, stat in enumerate(self.data_statistics, 1):
+                text_parts.append(f"{i}. {stat}")
+
+        if self.different_perspectives:
+            text_parts.append("\n## 異なる視点・意見")
+            for i, perspective in enumerate(self.different_perspectives, 1):
+                text_parts.append(f"{i}. {perspective}")
+
+        if self.date_analysis:
+            text_parts.append("\n## 日付分析")
+            for i, date_info in enumerate(self.date_analysis, 1):
+                text_parts.append(f"{i}. {date_info}")
+
+        if self.unknown_points:
+            text_parts.append("\n## 不明な点・追加調査が必要な項目")
+            for i, point in enumerate(self.unknown_points, 1):
+                text_parts.append(f"{i}. {point}")
+
+        return "\n".join(text_parts) if text_parts else "分析結果が得られませんでした。"
 
 class SummaryResponse(BaseModel):
     """要約の構造化レスポンス"""
     summary_text: str = Field(
         description="要約テキスト",
-        min_length=10
+        min_length=10,
+        default=""
     )
+
+    # 古い形式との互換性のため
+    key_facts: List[str] = Field(default_factory=list)
+    conclusion: str = Field(default="")
+    date_summary: str = Field(default="")
 
     def to_text(self) -> str:
         """構造化データをテキスト形式に変換"""
-        return self.summary_text
+        if self.summary_text:
+            return self.summary_text
+
+        # 古い形式からテキストを生成
+        text_parts = []
+
+        if self.key_facts:
+            text_parts.append("## 重要な事実")
+            for i, fact in enumerate(self.key_facts, 1):
+                text_parts.append(f"{i}. {fact}")
+
+        if self.conclusion:
+            text_parts.append(f"\n## 結論\n{self.conclusion}")
+
+        if self.date_summary:
+            text_parts.append(f"\n## 日付情報\n{self.date_summary}")
+
+        return "\n".join(text_parts) if text_parts else "要約が得られませんでした。"
 
 class FinalReportResponse(BaseModel):
     """最終レポートの構造化レスポンス"""
@@ -1261,7 +1383,7 @@ class DeepResearch:
         """追加検索クエリを生成"""
         print(f"🔍 追加検索クエリ生成中...")
 
-        # 設定ファイルからプロンプトを取得
+        # より効果的なプロンプトテンプレート
         prompt_template = self.config.get('prompts.additional_queries', """
 今日の日付情報: {today_info}
 
@@ -1310,7 +1432,10 @@ class DeepResearch:
             # 構造化レスポンスを生成
             response = self.model.generate_structured(prompt, AdditionalQueriesResponse)
             print(f"✅ 構造化レスポンスで追加クエリを生成")
-            return response.additional_queries
+
+            # 生成されたクエリを検証・改善
+            validated_queries = self._validate_and_improve_queries(response.additional_queries, original_query)
+            return validated_queries
         except Exception as e:
             print(f"⚠️  構造化レスポンスの生成に失敗: {e}")
             print("   フォールバック: 従来の方法で追加クエリを生成")
@@ -1327,7 +1452,51 @@ class DeepResearch:
                 if line and not line.startswith(('1.', '2.', '3.', '4.', '5.', '-', '*', '•')):
                     queries.append(line)
 
-            return queries[:5]  # 最大5つまで
+            # 生成されたクエリを検証・改善
+            validated_queries = self._validate_and_improve_queries(queries[:5], original_query)
+            return validated_queries
+
+    def _validate_and_improve_queries(self, queries: List[str], original_query: str) -> List[str]:
+        """生成されたクエリを検証・改善"""
+        improved_queries = []
+
+        for query in queries:
+            if not query or len(query.strip()) < 2:
+                continue
+
+            # 無効なキーワードを除外
+            invalid_patterns = [
+                'キーワード', '追加', '提案', '以下の', '各キーワード', '番号や記号',
+                '検索', 'クエリ', '生成', '作成', '分析', '要約'
+            ]
+
+            if any(pattern in query.lower() for pattern in invalid_patterns):
+                continue
+
+            # クエリの長さを調整（短すぎる場合は元のクエリと組み合わせ）
+            if len(query.split()) < 2:
+                # 元のクエリの主要部分と組み合わせ
+                original_words = original_query.split()[:2]
+                improved_query = f"{' '.join(original_words)} {query}"
+            else:
+                improved_query = query
+
+            # 重複を避ける
+            if improved_query not in improved_queries:
+                improved_queries.append(improved_query)
+
+        # 結果が少ない場合は、基本的なクエリを追加
+        if len(improved_queries) < 3:
+            basic_queries = [
+                f"{original_query} 最新情報",
+                f"{original_query} ニュース",
+                f"{original_query} 動向"
+            ]
+            for basic_query in basic_queries:
+                if basic_query not in improved_queries:
+                    improved_queries.append(basic_query)
+
+        return improved_queries[:5]  # 最大5つまで
 
     def _create_final_report(self, query: str, analysis: str, summary: str) -> str:
         """最終レポートを生成（改善版）"""
